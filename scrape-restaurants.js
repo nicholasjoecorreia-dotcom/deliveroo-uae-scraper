@@ -19,7 +19,7 @@ const CONCURRENCY = parseInt(process.env.CONCURRENCY || '1', 10);
 const BATCH_SIZE = 10; // restaurants per POST to Apps Script
 const MAX_RETRIES = 3;
 const RETRY_DELAY_MS = 5000;
-const FETCH_DELAY_MS = 3000; // 3s between requests (was 1.5s â more conservative)
+const FETCH_DELAY_MS = 3000; // 3s between requests (was 1.5s — more conservative)
 const POST_DELAY_MS = 500;
 const BATCH_PAUSE_MS = 30000; // 30s pause every BATCH_PAUSE_EVERY restaurants
 const BATCH_PAUSE_EVERY = 100;
@@ -72,7 +72,7 @@ function extractCuisines(headerTags) {
   for (const span of firstLine.spans) {
     if (span.typeName !== 'UISpanText') continue;
     const text = (span.text || '').trim();
-    if (!text || text === 'Â·') continue;
+    if (!text || text === '·') continue;
     // Skip non-cuisine spans (ratings, distances, times, prices)
     if (/^\d+\.\d/.test(text)) continue; // "4.8", "3.44 km away"
     if (/km\s*(away)?/i.test(text)) continue;
@@ -143,7 +143,12 @@ async function getProcessedIds() {
 
 // -- Step 3: Fetch a single restaurant page and extract data ----------------------
 async function fetchRestaurantPage(restaurant) {
-  const url = restaurant.url;
+  // Append geohash query param so Deliveroo serves the page (otherwise 403)
+  let url = restaurant.url;
+  if (restaurant.geohash) {
+    const separator = url.includes('?') ? '&' : '?';
+    url = `${url}${separator}geohash=${restaurant.geohash}`;
+  }
   let retries = MAX_RETRIES;
   let isRateLimited = false;
 
@@ -158,15 +163,15 @@ async function fetchRestaurantPage(restaurant) {
         },
       });
 
-      // Handle 404 â restaurant page no longer exists
+      // Handle 404 — restaurant page no longer exists
       if (resp.status === 404) {
         console.log(
-          `  [${timestamp()}] ${restaurant.id}: HTTP 404 â skipping (dead page)`
+          `  [${timestamp()}] ${restaurant.id}: HTTP 404 — skipping (dead page)`
         );
         return null; // Signal to caller: skip, not an error
       }
 
-      // Handle 429 â rate limited
+      // Handle 429 — rate limited
       if (resp.status === 429) {
         if (!isRateLimited) {
           isRateLimited = true;
@@ -174,7 +179,7 @@ async function fetchRestaurantPage(restaurant) {
         }
         const backoff = RATE_LIMIT_INITIAL_BACKOFF_MS * attempt;
         console.warn(
-          `  [${timestamp()}] Attempt ${attempt}/${retries} â HTTP 429 for ${restaurant.id}. Backing off ${(backoff / 1000).toFixed(0)}s...`
+          `  [${timestamp()}] Attempt ${attempt}/${retries} — HTTP 429 for ${restaurant.id}. Backing off ${(backoff / 1000).toFixed(0)}s...`
         );
         await sleep(backoff);
         continue;
@@ -303,7 +308,7 @@ async function processRestaurants(restaurants) {
 
       if (r.status === 'fulfilled') {
         if (r.value === null) {
-          // 404 â skipped dead page
+          // 404 — skipped dead page
           skipped++;
           consecutiveErrors = 0;
         } else {
@@ -453,7 +458,7 @@ async function main() {
 
   if (aborted) {
     console.log('\nRun was aborted due to consecutive errors.');
-    console.log('Re-run the workflow to resume â it picks up from Sheet 3 automatically.');
+    console.log('Re-run the workflow to resume — it picks up from Sheet 3 automatically.');
     process.exit(1);
   }
 
