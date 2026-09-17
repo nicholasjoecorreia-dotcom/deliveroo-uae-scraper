@@ -1,0 +1,39 @@
+name: Scrape Areas (Phase 1)
+
+on:
+  workflow_dispatch:
+    inputs:
+      start_index:
+        description: 'Start index (0-based, default 0)'
+        required: false
+        default: '0'
+      end_index:
+        description: 'End index (0 = all areas)'
+        required: false
+        default: '0'
+      batch_size:
+        description: 'Areas per batch before pause'
+        required: false
+        default: '25'
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Run Phase 1 scraper
+        env:
+          APPS_SCRIPT_URL: ${{ secrets.APPS_SCRIPT_URL }}
+          START_INDEX: ${{ github.event.inputs.start_index }}
+          END_INDEX: ${{ github.event.inputs.end_index }}
+          BATCH_SIZE: ${{ github.event.inputs.batch_size }}
+        run: node scrape-areas.js
