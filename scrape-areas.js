@@ -10,7 +10,6 @@
  *
  * Designed to run as a GitHub Action (workflow_dispatch).
  */
-
 const AREAS = require('./areas.js');
 
 // Config from environment
@@ -22,10 +21,10 @@ const BATCH_SIZE = parseInt(process.env.BATCH_SIZE || '25', 10);
 // Timing config
 const MAX_RETRIES = 3;
 const RETRY_DELAY_MS = 5000;
-const AREA_DELAY_MS = 2000;
-const POST_DELAY_MS = 500;
-const BATCH_PAUSE_MS = 15000;
-const RESTAURANT_POST_BATCH = 200; // restaurants per POST to Apps Script
+const AREA_DELAY_MS = 1500;
+const POST_DELAY_MS = 100;
+const BATCH_PAUSE_MS = 10000;
+const RESTAURANT_POST_BATCH = 500; // restaurants per POST to Apps Script
 
 const USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
