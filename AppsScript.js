@@ -151,14 +151,16 @@ function handleAreaInfo(data) {
 }
 
 /**
- * Write/dedup restaurants to Sheet 2
+ * Write/dedup restaurants to Sheet 2  —  OPTIMISED (batch read/write)
  *
- * Dedup logic:
- *  - Key: Restaurant ID
- *  - If restaurant already exists:
- *    → Update Rating, Rating Count, Image URL, Fulfilment Method (latest wins)
- *    → Append Neighbourhood ID (comma-separated, no duplicates)
- *  - If new: append as new row
+ * Old approach: 3-4 individual cell writes per duplicate → hundreds of API calls.
+ * New approach: 1 bulk read → modify in memory → 1 bulk write + 1 append.
+ *
+ * Dedup logic (unchanged):
+ *  - Key: Restaurant ID (column A)
+ *  - Existing: update Rating, Rating Count, Fulfilment Method, Image URL;
+ *              append Neighbourhood ID (comma-separated, no duplicates)
+ *  - New: append as new row
  */
 function handleRestaurants(data) {
   var restaurants = data.restaurants;
@@ -168,19 +170,21 @@ function handleRestaurants(data) {
 
   var sheet = getOrCreateSheet(SHEET2_NAME, SHEET2_HEADERS);
   var lastRow = sheet.getLastRow();
+  var numExisting = lastRow > 1 ? lastRow - 1 : 0;
 
-  // Build lookup map: restaurantId → row number
-  var idToRow = {};
-  if (lastRow > 1) {
-    var ids = sheet.getRange(2, 1, lastRow - 1, 1).getValues(); // Column A: Restaurant ID
-    for (var i = 0; i < ids.length; i++) {
-      var id = String(ids[i][0]);
-      if (id) {
-        idToRow[id] = i + 2; // 1-indexed, skip header
-      }
+  // ── 1. Bulk-read ALL existing data (single API call) ──
+  var existingData = [];
+  var idToIndex = {};   // restaurantId → index in existingData
+  if (numExisting > 0) {
+    existingData = sheet.getRange(2, 1, numExisting, SHEET2_HEADERS.length).getValues();
+    for (var i = 0; i < existingData.length; i++) {
+      var id = String(existingData[i][0]);
+      if (id) idToIndex[id] = i;
     }
   }
 
+  // ── 2. Process incoming restaurants in memory ──
+  var hasModifications = false;
   var newRows = [];
   var updated = 0;
 
@@ -189,33 +193,27 @@ function handleRestaurants(data) {
     var restId = String(r.restaurantId || '');
     if (!restId) continue;
 
-    var existingRow = idToRow[restId];
+    var existingIdx = idToIndex[restId];
 
-    if (existingRow) {
-      // ── UPDATE existing row ──
-      // Update Rating (col D=4), Rating Count (col E=5), Fulfilment Method (col F=6), Image URL (col I=9)
-      var updateValues = [
-        [r.rating || ''],
-        [r.ratingCount || ''],
-        [r.fulfilmentMethod || ''],
-      ];
-      sheet.getRange(existingRow, 4, 1, 3).setValues([
-        [r.rating || '', r.ratingCount || '', r.fulfilmentMethod || '']
-      ]);
-      sheet.getRange(existingRow, 9, 1, 1).setValues([[r.imageUrl || '']]);
+    if (existingIdx !== undefined) {
+      // Update in memory — no API calls
+      existingData[existingIdx][3] = r.rating || '';         // Rating
+      existingData[existingIdx][4] = r.ratingCount || '';    // Rating Count
+      existingData[existingIdx][5] = r.fulfilmentMethod || ''; // Fulfilment Method
+      existingData[existingIdx][8] = r.imageUrl || '';       // Image URL
 
-      // Append Neighbourhood ID (col G=7), avoid duplicates
-      var currentNIds = String(sheet.getRange(existingRow, 7).getValue() || '');
+      // Append Neighbourhood ID (no duplicates)
+      var currentNIds = String(existingData[existingIdx][6] || '');
       var newNId = String(r.neighbourhoodId || '');
       if (newNId && currentNIds.indexOf(newNId) === -1) {
-        var updatedNIds = currentNIds ? currentNIds + ', ' + newNId : newNId;
-        sheet.getRange(existingRow, 7).setValue(updatedNIds);
+        existingData[existingIdx][6] = currentNIds ? currentNIds + ', ' + newNId : newNId;
       }
 
+      hasModifications = true;
       updated++;
     } else {
-      // ── NEW row ──
-      newRows.push([
+      // New restaurant
+      var newRow = [
         restId,
         r.partnerDrnId || '',
         r.restaurantName || '',
@@ -225,18 +223,22 @@ function handleRestaurants(data) {
         String(r.neighbourhoodId || ''),
         r.restaurantPageUrl || '',
         r.imageUrl || '',
-      ]);
+      ];
+      newRows.push(newRow);
       // Track for within-batch dedup
-      idToRow[restId] = lastRow + newRows.length; // Predict future row number
+      idToIndex[restId] = numExisting + newRows.length - 1;
     }
   }
 
-  // Append all new rows at once
+  // ── 3. Bulk-write modified existing data (single API call) ──
+  if (hasModifications && numExisting > 0) {
+    sheet.getRange(2, 1, numExisting, SHEET2_HEADERS.length).setValues(existingData);
+  }
+
+  // ── 4. Append all new rows at once (single API call) ──
   if (newRows.length > 0) {
     var appendStart = sheet.getLastRow() + 1;
-    sheet
-      .getRange(appendStart, 1, newRows.length, SHEET2_HEADERS.length)
-      .setValues(newRows);
+    sheet.getRange(appendStart, 1, newRows.length, SHEET2_HEADERS.length).setValues(newRows);
   }
 
   return jsonResponse({
