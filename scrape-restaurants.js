@@ -15,12 +15,19 @@
 
 // -- Configuration ----------------------------------------------------------------
 const APPS_SCRIPT_URL = process.env.APPS_SCRIPT_URL;
-const CONCURRENCY = parseInt(process.env.CONCURRENCY || '3', 10);
+const CONCURRENCY = parseInt(process.env.CONCURRENCY || '1', 10);
 const BATCH_SIZE = 10; // restaurants per POST to Apps Script
 const MAX_RETRIES = 3;
 const RETRY_DELAY_MS = 5000;
-const FETCH_DELAY_MS = 1500; // ms between concurrency groups
+const FETCH_DELAY_MS = 3000; // 3s between requests (was 1.5s â more conservative)
 const POST_DELAY_MS = 500;
+const BATCH_PAUSE_MS = 30000; // 30s pause every BATCH_PAUSE_EVERY restaurants
+const BATCH_PAUSE_EVERY = 100;
+
+// Rate-limit (429) specific config
+const RATE_LIMIT_INITIAL_BACKOFF_MS = 60000; // 60s first 429 backoff
+const MAX_RATE_LIMIT_RETRIES = 5;            // more retries for 429
+const RATE_LIMIT_COOLDOWN_MS = 90000;        // 90s cooldown after 429 streak
 
 const USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
@@ -65,7 +72,7 @@ function extractCuisines(headerTags) {
   for (const span of firstLine.spans) {
     if (span.typeName !== 'UISpanText') continue;
     const text = (span.text || '').trim();
-    if (!text || text === '·') continue;
+    if (!text || text === 'Â·') continue;
     // Skip non-cuisine spans (ratings, distances, times, prices)
     if (/^\d+\.\d/.test(text)) continue; // "4.8", "3.44 km away"
     if (/km\s*(away)?/i.test(text)) continue;
@@ -137,8 +144,10 @@ async function getProcessedIds() {
 // -- Step 3: Fetch a single restaurant page and extract data ----------------------
 async function fetchRestaurantPage(restaurant) {
   const url = restaurant.url;
+  let retries = MAX_RETRIES;
+  let isRateLimited = false;
 
-  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+  for (let attempt = 1; attempt <= retries; attempt++) {
     try {
       const resp = await fetch(url, {
         headers: {
@@ -148,6 +157,28 @@ async function fetchRestaurantPage(restaurant) {
           'Accept-Language': 'en-US,en;q=0.5',
         },
       });
+
+      // Handle 404 â restaurant page no longer exists
+      if (resp.status === 404) {
+        console.log(
+          `  [${timestamp()}] ${restaurant.id}: HTTP 404 â skipping (dead page)`
+        );
+        return null; // Signal to caller: skip, not an error
+      }
+
+      // Handle 429 â rate limited
+      if (resp.status === 429) {
+        if (!isRateLimited) {
+          isRateLimited = true;
+          retries = MAX_RATE_LIMIT_RETRIES;
+        }
+        const backoff = RATE_LIMIT_INITIAL_BACKOFF_MS * attempt;
+        console.warn(
+          `  [${timestamp()}] Attempt ${attempt}/${retries} â HTTP 429 for ${restaurant.id}. Backing off ${(backoff / 1000).toFixed(0)}s...`
+        );
+        await sleep(backoff);
+        continue;
+      }
 
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
 
@@ -198,8 +229,16 @@ async function fetchRestaurantPage(restaurant) {
         restaurantPageUrl: restaurantPageUrl,
       };
     } catch (err) {
-      if (attempt < MAX_RETRIES) {
-        await sleep(RETRY_DELAY_MS * attempt);
+      if (!isRateLimited || !err.message?.includes('429')) {
+        console.error(
+          `  [${timestamp()}] Attempt ${attempt}/${retries} failed for ${restaurant.id}: ${err.message}`
+        );
+      }
+      if (attempt < retries) {
+        const delay = isRateLimited
+          ? RATE_LIMIT_INITIAL_BACKOFF_MS * attempt
+          : RETRY_DELAY_MS * attempt;
+        await sleep(delay);
       } else {
         throw new Error(`${restaurant.id}: ${err.message}`);
       }
@@ -241,14 +280,18 @@ async function postRestaurantInfo(restaurants) {
 // -- Main processing loop ---------------------------------------------------------
 async function processRestaurants(restaurants) {
   let completed = 0;
+  let skipped = 0;
   let errors = 0;
   let posted = 0;
   let batch = [];
+  let consecutiveErrors = 0;
+  const MAX_CONSECUTIVE_ERRORS = 10;
+  let totalProcessed = 0;
 
   for (let i = 0; i < restaurants.length; i += CONCURRENCY) {
     const chunk = restaurants.slice(i, i + CONCURRENCY);
 
-    // Fetch pages concurrently (staggered slightly)
+    // Fetch pages (sequentially when CONCURRENCY=1, or concurrently)
     const results = await Promise.allSettled(
       chunk.map((r, idx) =>
         sleep(idx * 300).then(() => fetchRestaurantPage(r))
@@ -256,46 +299,88 @@ async function processRestaurants(restaurants) {
     );
 
     for (const r of results) {
-      if (r.status === 'fulfilled') {
-        batch.push(r.value);
-        completed++;
+      totalProcessed++;
 
-        // Flush when batch is full
-        if (batch.length >= BATCH_SIZE) {
-          posted++;
-          try {
-            await postRestaurantInfo(batch);
-            console.log(
-              `  [${timestamp()}] Batch #${posted}: sent ${batch.length} restaurants  (${completed}/${restaurants.length} fetched, ${errors} errors)`
-            );
-          } catch (err) {
-            console.error(`  Batch #${posted} FAILED: ${err.message}`);
+      if (r.status === 'fulfilled') {
+        if (r.value === null) {
+          // 404 â skipped dead page
+          skipped++;
+          consecutiveErrors = 0;
+        } else {
+          batch.push(r.value);
+          completed++;
+          consecutiveErrors = 0;
+
+          // Flush when batch is full
+          if (batch.length >= BATCH_SIZE) {
+            posted++;
+            try {
+              await postRestaurantInfo(batch);
+              console.log(
+                `  [${timestamp()}] Batch #${posted}: sent ${batch.length} restaurants  (${completed}/${restaurants.length} fetched, ${skipped} skipped, ${errors} errors)`
+              );
+            } catch (err) {
+              console.error(`  Batch #${posted} FAILED: ${err.message}`);
+            }
+            batch = [];
+            await sleep(POST_DELAY_MS);
           }
-          batch = [];
-          await sleep(POST_DELAY_MS);
         }
       } else {
         errors++;
-        console.error(`  SKIP: ${r.reason?.message}`);
+        consecutiveErrors++;
+        const errMsg = r.reason?.message || 'Unknown error';
+        console.error(`  SKIP: ${errMsg}`);
+
+        // If rate-limited, add cooldown
+        if (errMsg.includes('429')) {
+          console.log(
+            `  [${timestamp()}] Rate-limit cooldown: waiting ${(RATE_LIMIT_COOLDOWN_MS / 1000).toFixed(0)}s before next restaurant...`
+          );
+          await sleep(RATE_LIMIT_COOLDOWN_MS);
+          consecutiveErrors = Math.max(0, consecutiveErrors - 1);
+        }
+
+        if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
+          console.error(
+            `\n${MAX_CONSECUTIVE_ERRORS} consecutive errors. Aborting.`
+          );
+          console.error(
+            `Processed ${totalProcessed} restaurants. Re-run to resume (auto-resumes from Sheet 3).`
+          );
+          // Flush remaining batch before aborting
+          if (batch.length > 0) {
+            try {
+              await postRestaurantInfo(batch);
+              console.log(`  Flushed ${batch.length} restaurants before abort`);
+            } catch (err) {
+              console.error(`  Flush failed: ${err.message}`);
+            }
+          }
+          return { completed, skipped, errors, batches: posted, aborted: true };
+        }
       }
     }
 
     // Progress heartbeat every 100 restaurants
-    if ((completed + errors) % 100 < CONCURRENCY) {
-      const pct = (((completed + errors) / restaurants.length) * 100).toFixed(
-        1
-      );
+    if (totalProcessed % 100 < CONCURRENCY) {
+      const pct = ((totalProcessed / restaurants.length) * 100).toFixed(1);
       const elapsed = ((Date.now() - globalStart) / 60000).toFixed(1);
-      const rate = (
-        ((completed + errors) / (Date.now() - globalStart)) *
-        60000
-      ).toFixed(0);
+      const rate = (totalProcessed / (Date.now() - globalStart) * 60000).toFixed(0);
       console.log(
-        `\n  -- Progress: ${completed + errors}/${restaurants.length} (${pct}%) | ${elapsed} min | ~${rate}/min | ${errors} errors --\n`
+        `\n  -- Progress: ${totalProcessed}/${restaurants.length} (${pct}%) | ${elapsed} min | ~${rate}/min | ${completed} ok, ${skipped} skipped, ${errors} errors --\n`
       );
     }
 
-    await sleep(FETCH_DELAY_MS);
+    // Batch pause every N restaurants to avoid sustained rate limiting
+    if (totalProcessed > 0 && totalProcessed % BATCH_PAUSE_EVERY === 0 && i < restaurants.length - 1) {
+      console.log(
+        `\n--- Batch pause after ${totalProcessed} restaurants (${completed} fetched so far) ---\n`
+      );
+      await sleep(BATCH_PAUSE_MS);
+    } else {
+      await sleep(FETCH_DELAY_MS);
+    }
   }
 
   // Flush remaining
@@ -311,7 +396,7 @@ async function processRestaurants(restaurants) {
     }
   }
 
-  return { completed, errors, batches: posted };
+  return { completed, skipped, errors, batches: posted, aborted: false };
 }
 
 // -- Entry point ------------------------------------------------------------------
@@ -327,6 +412,8 @@ async function main() {
   console.log('=== Deliveroo UAE Restaurant Scraper - Phase 2 ===');
   console.log(`Concurrency : ${CONCURRENCY}`);
   console.log(`Batch size  : ${BATCH_SIZE} restaurants per POST`);
+  console.log(`Fetch delay : ${FETCH_DELAY_MS}ms | Batch pause: ${BATCH_PAUSE_MS}ms every ${BATCH_PAUSE_EVERY}`);
+  console.log(`429 backoff : ${RATE_LIMIT_INITIAL_BACKOFF_MS}ms x attempt (max ${MAX_RATE_LIMIT_RETRIES} retries)`);
   console.log(`Started at  : ${new Date().toISOString()}`);
   console.log('');
 
@@ -353,14 +440,22 @@ async function main() {
 
   // 4 - Scrape & post
   console.log(`Step 3 - Scraping ${remaining.length} restaurant pages ...\n`);
-  const { completed, errors, batches } = await processRestaurants(remaining);
+  const { completed, skipped, errors, batches, aborted } =
+    await processRestaurants(remaining);
 
   const elapsed = ((Date.now() - globalStart) / 60000).toFixed(1);
   console.log('\n=== Phase 2 Complete ===');
   console.log(`Restaurants fetched : ${completed}`);
-  console.log(`Errors / skips      : ${errors}`);
+  console.log(`Restaurants skipped : ${skipped} (404 dead pages)`);
+  console.log(`Errors / failures   : ${errors}`);
   console.log(`Batches posted      : ${batches}`);
   console.log(`Wall time           : ${elapsed} minutes`);
+
+  if (aborted) {
+    console.log('\nRun was aborted due to consecutive errors.');
+    console.log('Re-run the workflow to resume â it picks up from Sheet 3 automatically.');
+    process.exit(1);
+  }
 
   if (errors > 0) {
     console.log(`\nNote: ${errors} restaurants were skipped due to errors.`);
