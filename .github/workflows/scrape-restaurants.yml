@@ -1,0 +1,29 @@
+name: Scrape Restaurants (Phase 2)
+
+on:
+  workflow_dispatch:
+    inputs:
+      concurrency:
+        description: 'Concurrent page fetches (default 3)'
+        required: false
+        default: '3'
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Run Phase 2 scraper
+        env:
+          APPS_SCRIPT_URL: ${{ secrets.APPS_SCRIPT_URL }}
+          CONCURRENCY: ${{ github.event.inputs.concurrency }}
+        run: node scrape-restaurants.js
