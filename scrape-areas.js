@@ -2,11 +2,11 @@
  * Deliveroo UAE Area Scraper (Phase 1)
  *
  * For each area in the directory:
- *  1. Fetches the area listing page HTML
- *  2. Extracts __NEXT_DATA__ JSON embedded in the page
- *  3. Parses area metadata (geohash, lat, lon) → Sheet 1 (Area Information)
- *  4. Parses restaurant listing blocks → Sheet 2 (List of Restaurants)
- *  5. POSTs both to a Google Apps Script web app
+ * 1. Fetches the area listing page HTML
+ * 2. Extracts __NEXT_DATA__ JSON embedded in the page
+ * 3. Parses area metadata (geohash, lat, lon) → Sheet 1 (Area Information)
+ * 4. Parses restaurant listing blocks → Sheet 2 (List of Restaurants)
+ * 5. POSTs both to a Google Apps Script web app
  *
  * Designed to run as a GitHub Action (workflow_dispatch).
  */
@@ -21,17 +21,22 @@ const BATCH_SIZE = parseInt(process.env.BATCH_SIZE || '25', 10);
 // Timing config
 const MAX_RETRIES = 3;
 const RETRY_DELAY_MS = 5000;
-const AREA_DELAY_MS = 1500;
+const AREA_DELAY_MS = 3000;        // 3s between areas (was 1.5s)
 const POST_DELAY_MS = 100;
-const BATCH_PAUSE_MS = 10000;
-const RESTAURANT_POST_BATCH = 500; // restaurants per POST to Apps Script
+const BATCH_PAUSE_MS = 30000;       // 30s batch pause (was 10s)
+const RESTAURANT_POST_BATCH = 500;  // restaurants per POST to Apps Script
+
+// Rate-limit (429) specific config
+const RATE_LIMIT_INITIAL_BACKOFF_MS = 60000;  // 60s first 429 backoff
+const MAX_RATE_LIMIT_RETRIES = 5;             // more retries for 429
+const RATE_LIMIT_COOLDOWN_MS = 90000;         // 90s cooldown after 429 streak
 
 const USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
   '(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36';
 
 function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function timestamp() {
@@ -149,10 +154,17 @@ function extractRestaurants(nextData, area) {
 }
 
 /**
- * Fetch a single area page and extract data
+ * Fetch a single area page and extract data.
+ * Returns { areaInfo, restaurants } on success.
+ * Returns null for HTTP 404 (dead area — skip without error).
+ * Throws on other failures after retries.
  */
 async function fetchArea(area, index) {
-  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+  // Determine retry strategy based on error type
+  let retries = MAX_RETRIES;
+  let isRateLimited = false;
+
+  for (let attempt = 1; attempt <= retries; attempt++) {
     try {
       const response = await fetch(area.url, {
         headers: {
@@ -162,6 +174,29 @@ async function fetchArea(area, index) {
           'Accept-Language': 'en-US,en;q=0.5',
         },
       });
+
+      // Handle 404 — area no longer exists on Deliveroo
+      if (response.status === 404) {
+        console.log(
+          `  [${timestamp()}] Area #${index} (${area.name}): HTTP 404 — skipping (dead area)`
+        );
+        return null; // Signal to caller: skip, not an error
+      }
+
+      // Handle 429 — rate limited
+      if (response.status === 429) {
+        if (!isRateLimited) {
+          // First 429 for this area: switch to longer retry strategy
+          isRateLimited = true;
+          retries = MAX_RATE_LIMIT_RETRIES;
+        }
+        const backoff = RATE_LIMIT_INITIAL_BACKOFF_MS * attempt;
+        console.warn(
+          `  [${timestamp()}] Attempt ${attempt}/${retries} — HTTP 429 for area #${index} (${area.name}). Backing off ${(backoff / 1000).toFixed(0)}s...`
+        );
+        await sleep(backoff);
+        continue;
+      }
 
       if (!response.ok) {
         throw new Error(`HTTP ${response.status} for ${area.name}`);
@@ -179,11 +214,17 @@ async function fetchArea(area, index) {
 
       return { areaInfo, restaurants };
     } catch (err) {
-      console.error(
-        `  [${timestamp()}] Attempt ${attempt}/${MAX_RETRIES} failed for area #${index} (${area.name}): ${err.message}`
-      );
-      if (attempt < MAX_RETRIES) {
-        await sleep(RETRY_DELAY_MS * attempt);
+      // Don't log again if it was a 429 (already logged above)
+      if (!isRateLimited || !err.message?.includes('429')) {
+        console.error(
+          `  [${timestamp()}] Attempt ${attempt}/${retries} failed for area #${index} (${area.name}): ${err.message}`
+        );
+      }
+      if (attempt < retries) {
+        const delay = isRateLimited
+          ? RATE_LIMIT_INITIAL_BACKOFF_MS * attempt
+          : RETRY_DELAY_MS * attempt;
+        await sleep(delay);
       } else {
         throw err;
       }
@@ -249,11 +290,16 @@ async function main() {
 
   console.log('=== Deliveroo UAE Area Scraper (Phase 1) ===');
   console.log(`Total areas in directory: ${AREAS.length}`);
-  console.log(`Processing: index ${START_INDEX} to ${endIndex - 1} (${areasToProcess.length} areas)`);
+  console.log(
+    `Processing: index ${START_INDEX} to ${endIndex - 1} (${areasToProcess.length} areas)`
+  );
   console.log(`Batch size: ${BATCH_SIZE} areas`);
+  console.log(`Area delay: ${AREA_DELAY_MS}ms | Batch pause: ${BATCH_PAUSE_MS}ms`);
+  console.log(`429 backoff: ${RATE_LIMIT_INITIAL_BACKOFF_MS}ms x attempt (max ${MAX_RATE_LIMIT_RETRIES} retries)`);
   console.log('');
 
   let processedAreas = 0;
+  let skippedAreas = 0;
   let totalRestaurants = 0;
   let errors = 0;
   let consecutiveErrors = 0;
@@ -269,7 +315,18 @@ async function main() {
         `[${timestamp()}] Area #${globalIndex}: ${area.name} (${area.emirate})...`
       );
 
-      const { areaInfo, restaurants } = await fetchArea(area, globalIndex);
+      const result = await fetchArea(area, globalIndex);
+
+      // null means 404 — skip gracefully
+      if (result === null) {
+        skippedAreas++;
+        // Don't count 404 as a consecutive error — it's expected for dead areas
+        consecutiveErrors = 0;
+        await sleep(AREA_DELAY_MS);
+        continue;
+      }
+
+      const { areaInfo, restaurants } = result;
 
       // POST area info to Sheet 1
       if (areaInfo) {
@@ -282,7 +339,7 @@ async function main() {
         let posted = 0;
         for (let j = 0; j < restaurants.length; j += RESTAURANT_POST_BATCH) {
           const batch = restaurants.slice(j, j + RESTAURANT_POST_BATCH);
-          const result = await postToAppsScript({
+          const postResult = await postToAppsScript({
             action: 'restaurants',
             restaurants: batch,
             neighbourhoodId: String(area.neighbourhoodId),
@@ -308,7 +365,7 @@ async function main() {
         const elapsed = ((Date.now() - startTime) / 60000).toFixed(1);
         const pct = (((i + 1) / areasToProcess.length) * 100).toFixed(1);
         console.log(
-          `\n  -- Progress: ${i + 1}/${areasToProcess.length} (${pct}%) | ${elapsed} min | ${totalRestaurants} total restaurant entries | ${errors} errors --\n`
+          `\n -- Progress: ${i + 1}/${areasToProcess.length} (${pct}%) | ${elapsed} min | ${totalRestaurants} total restaurant entries | ${errors} errors | ${skippedAreas} skipped --\n`
         );
       }
 
@@ -324,10 +381,24 @@ async function main() {
     } catch (err) {
       errors++;
       consecutiveErrors++;
-      errorLog.push({ index: globalIndex, area: area.name, error: err.message });
+      errorLog.push({
+        index: globalIndex,
+        area: area.name,
+        error: err.message,
+      });
       console.error(
         `  ERROR on area #${globalIndex} (${area.name}): ${err.message}`
       );
+
+      // If we just hit rate-limit errors, add a long cooldown before continuing
+      if (err.message && err.message.includes('429')) {
+        console.log(
+          `  [${timestamp()}] Rate-limit cooldown: waiting ${(RATE_LIMIT_COOLDOWN_MS / 1000).toFixed(0)}s before next area...`
+        );
+        await sleep(RATE_LIMIT_COOLDOWN_MS);
+        // Reset consecutive counter — we cooled down, give it another chance
+        consecutiveErrors = Math.max(0, consecutiveErrors - 1);
+      }
 
       if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
         console.error(
@@ -345,6 +416,7 @@ async function main() {
   const elapsed = ((Date.now() - startTime) / 60000).toFixed(1);
   console.log('\n=== Phase 1 Complete ===');
   console.log(`Areas processed: ${processedAreas}`);
+  console.log(`Areas skipped (404): ${skippedAreas}`);
   console.log(`Total restaurant entries sent: ${totalRestaurants}`);
   console.log(`Errors: ${errors}`);
   console.log(`Wall time: ${elapsed} minutes`);
