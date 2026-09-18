@@ -15,14 +15,16 @@
 
 // -- Configuration ----------------------------------------------------------------
 const APPS_SCRIPT_URL = process.env.APPS_SCRIPT_URL;
-const CONCURRENCY = parseInt(process.env.CONCURRENCY || '1', 10);
+const CONCURRENCY = parseInt(process.env.CONCURRENCY || '3', 10);
 const BATCH_SIZE = 10; // restaurants per POST to Apps Script
 const MAX_RETRIES = 3;
 const RETRY_DELAY_MS = 5000;
-const FETCH_DELAY_MS = 3000; // 3s between requests (was 1.5s — more conservative)
-const POST_DELAY_MS = 500;
-const BATCH_PAUSE_MS = 30000; // 30s pause every BATCH_PAUSE_EVERY restaurants
-const BATCH_PAUSE_EVERY = 100;
+const MAX_APPS_SCRIPT_RETRIES = 8;     // More retries for Apps Script (intermittent HTML responses)
+const APPS_SCRIPT_RETRY_DELAY_MS = 8000; // 8s between Apps Script retries
+const FETCH_DELAY_MS = 1500; // 1.5s between concurrent chunks
+const POST_DELAY_MS = 300;
+const BATCH_PAUSE_MS = 10000; // 10s pause every BATCH_PAUSE_EVERY restaurants
+const BATCH_PAUSE_EVERY = 200;
 
 // Rate-limit (429) specific config
 const RATE_LIMIT_INITIAL_BACKOFF_MS = 60000; // 60s first 429 backoff
@@ -97,10 +99,17 @@ async function getRestaurantUrls() {
   while (true) {
     const url = `${APPS_SCRIPT_URL}?action=getRestaurantUrls&offset=${offset}&limit=${limit}`;
 
-    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    for (let attempt = 1; attempt <= MAX_APPS_SCRIPT_RETRIES; attempt++) {
       try {
         const resp = await fetch(url, { redirect: 'follow' });
-        const data = await resp.json();
+        const text = await resp.text();
+
+        // Apps Script intermittently returns HTML instead of JSON (cold starts, Google infra)
+        if (text.trimStart().startsWith('<!DOCTYPE') || text.trimStart().startsWith('<html')) {
+          throw new Error('Apps Script returned HTML instead of JSON (intermittent Google issue)');
+        }
+
+        const data = JSON.parse(text);
         if (data.error) throw new Error(data.error);
 
         allRestaurants.push(...data.restaurants);
@@ -113,10 +122,10 @@ async function getRestaurantUrls() {
         break;
       } catch (err) {
         console.error(
-          `  Attempt ${attempt}/${MAX_RETRIES} to fetch URLs failed: ${err.message}`
+          `  Attempt ${attempt}/${MAX_APPS_SCRIPT_RETRIES} to fetch URLs failed: ${err.message}`
         );
-        if (attempt === MAX_RETRIES) throw err;
-        await sleep(RETRY_DELAY_MS * attempt);
+        if (attempt === MAX_APPS_SCRIPT_RETRIES) throw err;
+        await sleep(APPS_SCRIPT_RETRY_DELAY_MS * attempt);
       }
     }
   }
@@ -124,19 +133,26 @@ async function getRestaurantUrls() {
 
 // -- Step 2: Fetch already-processed IDs from Sheet 3 -----------------------------
 async function getProcessedIds() {
-  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+  for (let attempt = 1; attempt <= MAX_APPS_SCRIPT_RETRIES; attempt++) {
     try {
       const url = `${APPS_SCRIPT_URL}?action=getProcessedIds`;
       const resp = await fetch(url, { redirect: 'follow' });
-      const data = await resp.json();
+      const text = await resp.text();
+
+      // Handle intermittent HTML responses from Apps Script
+      if (text.trimStart().startsWith('<!DOCTYPE') || text.trimStart().startsWith('<html')) {
+        throw new Error('Apps Script returned HTML instead of JSON (intermittent Google issue)');
+      }
+
+      const data = JSON.parse(text);
       if (data.error) throw new Error(data.error);
       return new Set(data.ids.map((id) => String(id)));
     } catch (err) {
       console.error(
-        `  Attempt ${attempt}/${MAX_RETRIES} to fetch processed IDs: ${err.message}`
+        `  Attempt ${attempt}/${MAX_APPS_SCRIPT_RETRIES} to fetch processed IDs: ${err.message}`
       );
-      if (attempt === MAX_RETRIES) throw err;
-      await sleep(RETRY_DELAY_MS * attempt);
+      if (attempt === MAX_APPS_SCRIPT_RETRIES) throw err;
+      await sleep(APPS_SCRIPT_RETRY_DELAY_MS * attempt);
     }
   }
 }
@@ -253,7 +269,7 @@ async function fetchRestaurantPage(restaurant) {
 
 // -- Step 4: POST a batch to Apps Script ------------------------------------------
 async function postRestaurantInfo(restaurants) {
-  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+  for (let attempt = 1; attempt <= MAX_APPS_SCRIPT_RETRIES; attempt++) {
     try {
       const resp = await fetch(APPS_SCRIPT_URL, {
         method: 'POST',
@@ -263,6 +279,12 @@ async function postRestaurantInfo(restaurants) {
       });
 
       const text = await resp.text();
+
+      // Handle intermittent HTML responses from Apps Script
+      if (text.trimStart().startsWith('<!DOCTYPE') || text.trimStart().startsWith('<html')) {
+        throw new Error('Apps Script returned HTML instead of JSON (intermittent Google issue)');
+      }
+
       let result;
       try {
         result = JSON.parse(text);
@@ -272,9 +294,9 @@ async function postRestaurantInfo(restaurants) {
       if (result.error) throw new Error(result.error);
       return result;
     } catch (err) {
-      if (attempt < MAX_RETRIES) {
+      if (attempt < MAX_APPS_SCRIPT_RETRIES) {
         console.error(`  POST attempt ${attempt}: ${err.message}`);
-        await sleep(RETRY_DELAY_MS * attempt);
+        await sleep(APPS_SCRIPT_RETRY_DELAY_MS * attempt);
       } else {
         throw err;
       }
@@ -299,7 +321,7 @@ async function processRestaurants(restaurants) {
     // Fetch pages (sequentially when CONCURRENCY=1, or concurrently)
     const results = await Promise.allSettled(
       chunk.map((r, idx) =>
-        sleep(idx * 300).then(() => fetchRestaurantPage(r))
+        sleep(idx * 500).then(() => fetchRestaurantPage(r))
       )
     );
 
